@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D Rhinorigami Sanctuary</title>
+    <!-- Import Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Import Sharpie-style handwriting font -->
+    <link href="https://fonts.googleapis.com/css2?family=Permanent+Marker&display=swap" rel="stylesheet">
+    <style>
+        body {
+            margin: 0; 
+            overflow: hidden; 
+            background-color: #a88b6a; 
+            font-family: 'Permanent Marker', 'Marker Felt', cursive;
+            touch-action: none; 
+        }
+        
+        #canvas-container {
+            position: absolute;
+            top: 0; left: 0; width: 100vw; height: 100vh;
+            z-index: 1;
+        }
+
+        /* 2D UI Overlay perfectly aligned to the Goldilocks camera zoom */
+        #ui-layer {
+            position: absolute;
+            top: 50%; left: 50%;
+            /* ScaleY mimics the camera angle, rotate mimics the pad */
+            transform: translate(-50%, -46%) scaleY(0.76) rotate(-11.25deg); 
+            width: 170px; height: 170px; 
+            z-index: 10;
+            pointer-events: none; 
+        }
+
+        #note-input {
+            width: 100%; height: 100%;
+            background: transparent; border: none; outline: none;
+            color: rgba(20, 20, 25, 0.3); /* Faint ghost ink while typing */
+            font-size: 22px; 
+            font-family: 'Permanent Marker', 'Marker Felt', cursive;
+            text-align: center; 
+            
+            /* Perfect vertical and horizontal centering */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            
+            pointer-events: auto; 
+            padding: 10px; box-sizing: border-box;
+            line-height: 1.3;
+        }
+
+        #note-input:focus {
+            color: rgba(20, 20, 25, 0.5); /* Darken slightly when typing */
+        }
+
+        /* Sleep Screen Overlay */
+        #night-overlay {
+            position: absolute; top: 0; left: 0; width: 100vw; height: 100vh;
+            background: rgba(10, 15, 30, 0.0);
+            pointer-events: none;
+            z-index: 5;
+            transition: background 3s ease-in-out;
+        }
+        body.sleeping #night-overlay {
+            background: rgba(10, 15, 30, 0.6);
+        }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container"></div>
+    <div id="night-overlay"></div>
+    
+    <div id="ui-layer">
+        <div id="note-input" contenteditable="true" spellcheck="false">I love you</div>
+    </div>
+
+    <script>
+        // --- 1. CORE SETUP & VARIABLES ---
+        const colors = {
+            yellow: 0xffff88, // Rhino
+            blue: 0xa0d8ef,   // Turtle
+            pink: 0xfbcce7    // Crane
+        };
+        const sequence = [colors.yellow, colors.blue, colors.pink];
+        let colorIndex = 0;
+        
+        let scene, camera, renderer;
+        let padGroup, topSheetMesh;
+        const creatures = [];
+        let sleepTimer;
+        let isSleeping = false;
+        
+        let topSheetCanvas, topSheetCtx, topSheetTexture;
+        let isWriting = false;
+
+        const clock = new THREE.Clock();
+
+        // --- 2. AUDIO ENGINE ---
+        let audioCtx;
+        
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        function playSlowScribble() {
+            if (!audioCtx) return;
+            const dur = 0.1 + Math.random() * 0.08; 
+            const bufferSize = audioCtx.sampleRate * dur;
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1; 
+            
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buffer;
+            
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.value = 600 + Math.random() * 300; 
+            
+            const gain = audioCtx.createGain();
+            gain.gain.setValueAtTime(0, audioCtx.currentTime); 
+            gain.gain.linearRampToValueAtTime(0.06, audioCtx.currentTime + 0.02); 
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+            
+            noise.connect(filter).connect(gain).connect(audioCtx.destination);
+            noise.start();
+        }
+
+        function playFold() {
+            if (!audioCtx) return;
+            const dur = 0.25;
+            const bufferSize = audioCtx.sampleRate * dur;
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+            
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buffer;
+            
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'bandpass';
+            filter.frequency.setValueAtTime(400, audioCtx.currentTime);
+            filter.frequency.linearRampToValueAtTime(1000, audioCtx.currentTime + dur);
+            
+            const gain = audioCtx.createGain();
+            gain.gain.setValueAtTime(0, audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(0.4, audioCtx.currentTime + 0.05); 
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + dur); 
+            
+            noise.connect(filter).connect(gain).connect(audioCtx.destination);
+            noise.start();
+        }
+
+        // --- 3. INITIALIZE THREE.JS ---
+        window.onload = function() {
+            // Wait for custom font to load before rendering text onto 3D canvas
+            document.fonts.ready.then(() => {
+                init3D();
+                setupInteractions();
+                resetSleepTimer();
+                animate();
+            });
+        };
+
+        function init3D() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xa88b6a); 
+            scene.fog = new THREE.Fog(0xa88b6a, 50, 200);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 1000);
+            
+            // PERFECT ZOOM: Balanced desk view
+            camera.position.set(0, 90, 105); 
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambient);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+            dirLight.position.set(50, 100, 30);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.camera.left = -100;
+            dirLight.shadow.camera.right = 100;
+            dirLight.shadow.camera.top = 100;
+            dirLight.shadow.camera.bottom = -100;
+            scene.add(dirLight);
+
+            const deskGeo = new THREE.PlaneGeometry(1000, 1000);
+            const deskMat = new THREE.MeshStandardMaterial({ color: 0x8b5a2b, roughness: 0.9 });
+            const desk = new THREE.Mesh(deskGeo, deskMat);
+            desk.rotation.x = -Math.PI / 2;
+            desk.receiveShadow = true;
+            scene.add(desk);
+
+            padGroup = new THREE.Group();
+            
+            const padBaseGeo = new THREE.BoxGeometry(40, 6, 40);
+            const padBaseMat = new THREE.MeshStandardMaterial({ color: 0xddddcc });
+            const padBase = createOutlinedMesh(padBaseGeo, padBaseMat);
+            padBase.position.y = 3;
+            padGroup.add(padBase);
+
+            const topGeo = new THREE.BoxGeometry(40, 1, 40);
+            topSheetMesh = createOutlinedMesh(topGeo, new THREE.MeshStandardMaterial());
+            topSheetMesh.position.y = 6.5;
+            padGroup.add(topSheetMesh);
+
+            initDynamicPad(); // Setup text canvas
+
+            padGroup.position.set(0, 0, 0); 
+            padGroup.rotation.y = Math.PI / 16; // 11.25 degrees
+            scene.add(padGroup);
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        // --- 4. GEOMETRY & TEXTURES ---
+        function createOutlinedMesh(geometry, material) {
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            
+            const edges = new THREE.EdgesGeometry(geometry);
+            const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 }));
+            mesh.add(line);
+            return mesh;
+        }
+
+        function drawTextOnCanvas(ctx, colorHex, textToDraw) {
+            ctx.fillStyle = '#' + new THREE.Color(colorHex).getHexString();
+            ctx.fillRect(0, 0, 512, 512);
+
+            if (textToDraw && textToDraw.trim() !== '') {
+                ctx.fillStyle = 'rgba(20, 20, 25, 0.9)'; // Dark ink
+                ctx.font = '48px "Permanent Marker", cursive';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                
+                ctx.save();
+                ctx.translate(256, 256);
+
+                const words = textToDraw.split(' ');
+                let lines = [];
+                let currentLine = '';
+                
+                for(let i=0; i<words.length; i++) {
+                    if (currentLine.length + words[i].length > 12) {
+                        lines.push(currentLine.trim());
+                        currentLine = words[i] + ' ';
+                    } else {
+                        currentLine += words[i] + ' ';
+                    }
+                }
+                if (currentLine.trim() !== '') lines.push(currentLine.trim());
+                
+                let lineHeight = 55;
+                let startY = -((lines.length - 1) * lineHeight) / 2;
+                
+                lines.forEach((line, index) => {
+                    ctx.fillText(line, 0, startY + (index * lineHeight));
+                });
+                
+                // Small corner stamps so origami folds catch the text
+                ctx.font = '24px "Permanent Marker", cursive';
+                ctx.rotate(Math.PI / 4);
+                ctx.fillText(textToDraw, -150, -150);
+                ctx.fillText(textToDraw, 150, 150);
+                ctx.rotate(-Math.PI / 2);
+                ctx.fillText(textToDraw, -150, 150);
+                ctx.fillText(textToDraw, 150, -150);
+
+                ctx.restore();
+            }
+        }
+
+        function initDynamicPad() {
+            topSheetCanvas = document.createElement('canvas');
+            topSheetCanvas.width = 512;
+            topSheetCanvas.height = 512;
+            topSheetCtx = topSheetCanvas.getContext('2d');
+            topSheetTexture = new THREE.CanvasTexture(topSheetCanvas);
+            
+            updatePadTexture(sequence[colorIndex], '');
+            
+            topSheetMesh.material = new THREE.MeshStandardMaterial({ 
+                map: topSheetTexture, color: 0xffffff, flatShading: true, roughness: 0.8 
+            });
+        }
+
+        function updatePadTexture(colorHex, textToDraw) {
+            drawTextOnCanvas(topSheetCtx, colorHex, textToDraw);
+            topSheetTexture.needsUpdate = true;
+        }
+
+        function createOrigamiMaterial(colorHex, text) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            drawTextOnCanvas(ctx, colorHex, text);
+            return new THREE.MeshStandardMaterial({ 
+                map: new THREE.CanvasTexture(canvas), color: 0xffffff, flatShading: true, roughness: 0.8 
+            });
+        }
+
+        // --- 5. PROCEDURAL ORIGAMI GENERATION ---
+        function createRhino(color, text) {
+            const group = new THREE.Group();
+            const mat = createOrigamiMaterial(color, text); 
+            
+            const body = createOutlinedMesh(new THREE.BoxGeometry(10, 8, 14), mat);
+            body.position.y = 6;
+            group.add(body);
+            
+            const headGeo = new THREE.ConeGeometry(4, 8, 4);
+            headGeo.rotateX(-Math.PI / 2);
+            headGeo.rotateY(Math.PI / 4);
+            const head = createOutlinedMesh(headGeo, mat);
+            head.position.set(0, 6, 10);
+            group.add(head);
+
+            const horn = createOutlinedMesh(new THREE.ConeGeometry(1, 4, 4), mat);
+            horn.rotation.x = Math.PI / 4;
+            horn.position.set(0, 8, 13);
+            group.add(horn);
+
+            const legGeo = new THREE.BoxGeometry(2, 4, 3);
+            const positions = [[-3, 2, 5], [3, 2, 5], [-3, 2, -5], [3, 2, -5]];
+            positions.forEach(pos => {
+                const leg = createOutlinedMesh(legGeo, mat);
+                leg.position.set(...pos);
+                group.add(leg);
+            });
+
+            return { group, type: 'rhino', speed: 15, hitbox: 12 };
+        }
+
+        function createTurtle(color, text) {
+            const group = new THREE.Group();
+            const mat = createOrigamiMaterial(color, text); 
+            
+            const shell = createOutlinedMesh(new THREE.CylinderGeometry(8, 8, 3, 6), mat);
+            shell.position.y = 4;
+            group.add(shell);
+
+            const head = createOutlinedMesh(new THREE.BoxGeometry(3, 3, 4), mat);
+            head.position.set(0, 4, 9);
+            group.add(head);
+
+            const flipGeo = new THREE.ConeGeometry(2, 7, 3);
+            flipGeo.rotateX(Math.PI / 2);
+            const positions = [
+                [-6, 2, 5, Math.PI/4], [6, 2, 5, -Math.PI/4], 
+                [-5, 2, -5, Math.PI/1.5], [5, 2, -5, -Math.PI/1.5]
+            ];
+            positions.forEach(pos => {
+                const flip = createOutlinedMesh(flipGeo, mat);
+                flip.position.set(pos[0], pos[1], pos[2]);
+                flip.rotation.y = pos[3];
+                group.add(flip);
+            });
+
+            return { group, type: 'turtle', speed: 8, hitbox: 10 };
+        }
+
+        function createCrane(color, text) {
+            const group = new THREE.Group();
+            const mat = createOrigamiMaterial(color, text); 
+            
+            const body = createOutlinedMesh(new THREE.TetrahedronGeometry(4), mat);
+            body.position.y = 8;
+            group.add(body);
+
+            const neck = createOutlinedMesh(new THREE.ConeGeometry(1, 12, 3), mat);
+            neck.rotation.x = -Math.PI / 3;
+            neck.position.set(0, 12, 6);
+            group.add(neck);
+
+            const tail = createOutlinedMesh(new THREE.ConeGeometry(1, 10, 3), mat);
+            tail.rotation.x = Math.PI / 3;
+            tail.position.set(0, 10, -5);
+            group.add(tail);
+
+            const wingGroupL = new THREE.Group();
+            const wingGroupR = new THREE.Group();
+            
+            const wingGeo = new THREE.ConeGeometry(5, 14, 3);
+            wingGeo.rotateZ(Math.PI / 2);
+            
+            const wingL = createOutlinedMesh(wingGeo, mat);
+            wingL.position.set(7, 0, 0); 
+            wingGroupL.add(wingL);
+            wingGroupL.position.set(0, 8, 0);
+
+            const wingR = createOutlinedMesh(wingGeo, mat);
+            wingR.position.set(-7, 0, 0);
+            wingGroupR.add(wingR);
+            wingGroupR.position.set(0, 8, 0);
+
+            group.add(wingGroupL);
+            group.add(wingGroupR);
+
+            return { group, type: 'crane', speed: 25, hitbox: 8, wings: [wingGroupL, wingGroupR] };
+        }
+
+        // --- 6. INTERACTION & LOGIC ---
+        function setupInteractions() {
+            const input = document.getElementById('note-input');
+            let firstNotePosted = false;
+            let lastTapTime = 0;
+
+            window.addEventListener('keydown', initAudio, { once: true });
+            window.addEventListener('mousedown', initAudio, { once: true });
+            window.addEventListener('touchstart', initAudio, { once: true });
+
+            function triggerSpawnEvent(e) {
+                if (e) e.preventDefault(); 
+                initAudio();
+                
+                let text = input.innerText.trim(); 
+                
+                // The very first note will ALWAYS be "I love you"
+                if (!firstNotePosted) {
+                    text = "I love you";
+                    firstNotePosted = true;
+                }
+
+                if (text !== '' && !isWriting) {
+                    input.innerText = '';
+                    input.contentEditable = "false"; // Lock input
+                    resetSleepTimer();
+                    startWritingAnimation(text);
+                }
+            }
+
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') triggerSpawnEvent(e);
+            });
+
+            // Double Tap / Click logic
+            input.addEventListener('touchend', (e) => {
+                const currentTime = new Date().getTime();
+                if (currentTime - lastTapTime < 400 && currentTime - lastTapTime > 0) {
+                    triggerSpawnEvent(e);
+                }
+                lastTapTime = currentTime;
+            });
+            input.addEventListener('dblclick', (e) => triggerSpawnEvent(e));
+
+            window.addEventListener('mousedown', resetSleepTimer);
+            window.addEventListener('touchstart', resetSleepTimer);
+        }
+
+        function startWritingAnimation(fullText) {
+            isWriting = true;
+            let charIndex = 0;
+            const color = sequence[colorIndex];
+            
+            let writingAudioInterval = setInterval(playSlowScribble, 250);
+            playSlowScribble(); 
+
+            function typeChar() {
+                charIndex++;
+                updatePadTexture(color, fullText.substring(0, charIndex));
+                
+                if (charIndex < fullText.length) {
+                    setTimeout(typeChar, 80 + Math.random() * 80); 
+                } else {
+                    clearInterval(writingAudioInterval);
+                    setTimeout(() => {
+                        spawnCreature(fullText);
+                        
+                        colorIndex = (colorIndex + 1) % sequence.length;
+                        updatePadTexture(sequence[colorIndex], '');
+                        
+                        isWriting = false;
+                        const input = document.getElementById('note-input');
+                        input.contentEditable = "true";
+                        input.focus();
+                    }, 600); 
+                }
+            }
+            typeChar();
+        }
+
+        function spawnCreature(text) {
+            const color = sequence[(colorIndex + 2) % 3]; // Pull from previous color
+            let data;
+            
+            if (color === colors.yellow) data = createRhino(color, text);
+            else if (color === colors.blue) data = createTurtle(color, text);
+            else data = createCrane(color, text);
+
+            data.group.position.set(0, 8, 0); 
+            data.group.scale.set(0.01, 0.01, 0.01); 
+            data.angle = Math.random() * Math.PI * 2;
+            data.state = 'spawning';
+            data.scale = 0;
+
+            scene.add(data.group);
+            creatures.push(data);
+
+            playFold();
+            setTimeout(playFold, 150);
+            setTimeout(playFold, 350);
+        }
+
+        // --- 7. HIBERNATION ---
+        function resetSleepTimer() {
+            clearTimeout(sleepTimer);
+            if(isSleeping) {
+                isSleeping = false;
+                document.body.classList.remove('sleeping');
+                creatures.forEach(c => c.state = 'moving');
+            }
+            sleepTimer = setTimeout(() => {
+                isSleeping = true;
+                document.body.classList.add('sleeping');
+                creatures.forEach(c => {
+                    c.state = 'sleeping';
+                    c.targetX = -60 + (Math.random() * 30 - 15);
+                    c.targetZ = -60 + (Math.random() * 30 - 15);
+                });
+            }, 55000);
+        }
+
+        // --- 8. ANIMATION LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            creatures.forEach(c => {
+                if (c.state === 'spawning') {
+                    c.scale += delta * 2;
+                    if (c.scale >= 1) {
+                        c.scale = 1;
+                        c.state = 'moving';
+                    }
+                    c.group.scale.setScalar(c.scale);
+                }
+
+                if (c.state === 'moving' || c.state === 'sleeping') {
+                    let moveSpeed = c.speed * delta;
+                    let currentAngle = c.angle;
+
+                    if (c.state === 'sleeping') {
+                        const dx = c.targetX - c.group.position.x;
+                        const dz = c.targetZ - c.group.position.z;
+                        currentAngle = Math.atan2(dx, dz);
+                        
+                        if (Math.hypot(dx, dz) < 2) moveSpeed = 0; 
+                        else moveSpeed = c.speed * delta * 0.5; 
+                    }
+
+                    if (moveSpeed > 0) {
+                        let nextX = c.group.position.x + Math.sin(currentAngle) * moveSpeed;
+                        let nextZ = c.group.position.z + Math.cos(currentAngle) * moveSpeed;
+                        let bounced = false;
+
+                        const boundX = 100; 
+                        const boundZ = 90; 
+                        if (nextX < -boundX || nextX > boundX) { c.angle = -c.angle; bounced = true; }
+                        if (nextZ < -boundZ || nextZ > boundZ) { c.angle = Math.PI - c.angle; bounced = true; }
+
+                        const padRadius = 25;
+                        const distToPad = Math.hypot(nextX, nextZ);
+                        if (!bounced && distToPad < padRadius + c.hitbox) {
+                            if (distToPad >= padRadius * 0.5) {
+                                const normalAngle = Math.atan2(nextX, nextZ);
+                                c.angle = (2 * normalAngle) - currentAngle - Math.PI;
+                                c.angle += (Math.random() - 0.5); 
+                                
+                                nextX = Math.sin(normalAngle) * (padRadius + c.hitbox);
+                                nextZ = Math.cos(normalAngle) * (padRadius + c.hitbox);
+                            }
+                        }
+
+                        c.group.position.x = nextX;
+                        c.group.position.z = nextZ;
+                        c.group.rotation.y = currentAngle;
+                    }
+
+                    if (c.type === 'rhino' && moveSpeed > 0) {
+                        c.group.rotation.z = Math.sin(time * 15) * 0.1;
+                        c.group.position.y = 8 + Math.abs(Math.sin(time * 15)) * 1.5;
+                    } 
+                    else if (c.type === 'turtle') {
+                        c.group.position.y = 8 + Math.sin(time * 3 + c.group.id) * 1;
+                        c.group.rotation.z = Math.sin(time * 2) * 0.05;
+                    } 
+                    else if (c.type === 'crane') {
+                        c.group.position.y = 15 + Math.sin(time * 5) * 3;
+                        if (moveSpeed > 0) {
+                            c.wings[0].rotation.z = -Math.PI/6 + Math.sin(time * 20) * 0.5;
+                            c.wings[1].rotation.z = Math.PI/6 - Math.sin(time * 20) * 0.5;
+                        } else {
+                            c.wings[0].rotation.z = -Math.PI/4;
+                            c.wings[1].rotation.z = Math.PI/4;
+                        }
+                    }
+
+                    if (c.state === 'sleeping' && moveSpeed === 0) {
+                        c.group.position.y = 8;
+                        c.group.rotation.z = 0;
+                    }
+                }
+            });
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
+
+
